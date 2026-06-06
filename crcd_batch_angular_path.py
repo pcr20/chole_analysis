@@ -81,6 +81,30 @@ def abs_speed_deg_s(theta_rad, t):
     return spd[np.isfinite(spd) & (dt > 0)]
 
 
+def count_actuations(jaw_rad, min_amp_deg=10.0):
+    """Count grasp/cut actuations = jaw open->close transitions, with hysteresis.
+    Returns (n_actuations, jaw_amplitude_deg). A non-jawed tool (e.g. cautery hook)
+    has near-flat jaw -> amplitude below min_amp_deg -> 0 actuations."""
+    if len(jaw_rad) < 3:
+        return 0, 0.0
+    jaw = np.degrees(np.asarray(jaw_rad, dtype=float))
+    lo, hi = np.percentile(jaw, [5, 95])
+    amp = float(hi - lo)
+    if amp < min_amp_deg:                      # jaw essentially static -> not actuating
+        return 0, amp
+    close_thr = lo + 0.20 * amp                # hysteresis band avoids jitter recounts
+    open_thr = lo + 0.60 * amp
+    n, state = 0, None
+    for v in jaw:
+        if state is None:
+            state = "open" if v >= open_thr else ("closed" if v <= close_thr else None)
+        elif state == "open" and v <= close_thr:
+            n += 1; state = "closed"           # one grasp/cut
+        elif state == "closed" and v >= open_thr:
+            state = "open"
+    return n, amp
+
+
 def resolve_joint_indices(names):
     """Map roll/pitch/yaw to joint indices using names; fall back to defaults."""
     idx = dict(DEFAULT_IDX)
@@ -119,17 +143,19 @@ def find_tool_topic(topics, arm, override):
 
 
 def read_arm(bag_path, arm, tool_topic):
-    """Return per-sample arrays for one arm: t, roll, pitch, yaw (rad), and the
-    tool-change series (tool_t, tool_name)."""
+    """Return per-sample arrays for one arm: t, roll, pitch, yaw (rad), the jaw
+    angle series (jaw_t, jaw), and the tool-change series (tool_t, tool_name)."""
     from rosbags.highlevel import AnyReader
 
     js_topic = f"/{arm}/measured_js"
+    jaw_topic = f"/{arm}/jaw/measured_js"
     t, roll, pitch, yaw = [], [], [], []
+    jaw_t, jaw = [], []
     tool_t, tool_name = [], []
     idx = None
 
     with AnyReader([Path(bag_path)]) as reader:
-        want = {js_topic}
+        want = {js_topic, jaw_topic}
         if tool_topic:
             want.add(tool_topic)
         conns = [c for c in reader.connections if c.topic in want]
@@ -147,12 +173,17 @@ def read_arm(bag_path, arm, tool_topic):
                 pitch.append(pos[idx["pitch"]])
                 yaw.append(pos[idx["yaw"]])
                 t.append(ts_ns / 1e9)
+            elif con.topic == jaw_topic:
+                pos = np.asarray(msg.position, dtype=float)
+                if pos.size:
+                    jaw.append(pos[0]); jaw_t.append(ts_ns / 1e9)
             else:  # tool-type string
                 tool_t.append(ts_ns / 1e9)
                 tool_name.append(str(getattr(msg, "data", "")).strip())
 
     return {"t": np.array(t), "roll": np.array(roll),
             "pitch": np.array(pitch), "yaw": np.array(yaw),
+            "jaw_t": np.array(jaw_t), "jaw": np.array(jaw),
             "tool_t": np.array(tool_t), "tool_name": tool_name,
             "joint_idx": idx}
 
@@ -172,7 +203,7 @@ def label_instruments(t, tool_t, tool_name):
     return labels.astype(object)
 
 
-def segment_metrics(d, deadband, rom_pct, speed_pct, downsample):
+def segment_metrics(d, deadband, rom_pct, speed_pct, jaw_min_amp, downsample):
     """Return {instrument: metrics dict} for a single arm's data dict."""
     t = d["t"]
     if downsample > 1:
@@ -181,6 +212,18 @@ def segment_metrics(d, deadband, rom_pct, speed_pct, downsample):
     else:
         roll, pitch, yaw = d["roll"], d["pitch"], d["yaw"]
     labels = label_instruments(t, d["tool_t"], d["tool_name"])
+
+    # jaw stream is separate (own timestamps); label it independently
+    jaw_t, jaw = d.get("jaw_t", np.array([])), d.get("jaw", np.array([]))
+    jaw_labels = label_instruments(jaw_t, d["tool_t"], d["tool_name"])
+    jaw_acc = {}
+    if len(jaw_t):
+        jch = np.where(jaw_labels[1:] != jaw_labels[:-1])[0] + 1
+        for s, e in zip(np.concatenate(([0], jch)), np.concatenate((jch, [len(jaw_labels)]))):
+            n, amp = count_actuations(jaw[s:e], jaw_min_amp)
+            a = jaw_acc.setdefault(jaw_labels[s], {"n": 0, "amp": []})
+            a["n"] += n
+            a["amp"].append(jaw[s:e])
 
     results = {}
     if len(t) == 0:
@@ -221,8 +264,15 @@ def segment_metrics(d, deadband, rom_pct, speed_pct, downsample):
         pl, pu, ps = rom_bounds_deg(pv, rom_pct)
         yl, yu, ys = rom_bounds_deg(yv, rom_pct)
         rl, ru, rs = rom_bounds_deg(rv, rom_pct)
+        ja = jaw_acc.get(name, {"n": 0, "amp": []})
+        jaw_amp = (float(np.degrees(np.percentile(np.concatenate(ja["amp"]), 95)
+                                    - np.percentile(np.concatenate(ja["amp"]), 5)))
+                   if ja["amp"] and np.concatenate(ja["amp"]).size else np.nan)
         out[name] = {
             "duration_s": round(a["dur"], 1), "n_samples": int(a["n"]),
+            "jaw_actuations": int(ja["n"]),
+            "jaw_amp_deg": round(jaw_amp, 1) if jaw_amp == jaw_amp else np.nan,
+            "has_jaw": bool(ja["n"] > 0),
             "pitch_travel_deg": round(a["pitch_travel"], 1),
             "yaw_travel_deg": round(a["yaw_travel"], 1),
             "roll_travel_deg": round(a["roll_travel"], 1),
@@ -355,6 +405,8 @@ def main():
     ap.add_argument("--rom-pct", type=float, default=95.0, help="central pct for ROM bounds")
     ap.add_argument("--speed-pct", type=float, default=95.0,
                     help="one-sided upper pct for |angular speed| (default 95)")
+    ap.add_argument("--jaw-min-amp", type=float, default=10.0,
+                    help="min jaw swing (deg) to count as an actuating tool (else 0)")
     ap.add_argument("--downsample", type=int, default=1)
     ap.add_argument("--out", default="crcd_angular_path_by_instrument.csv")
     ap.add_argument("--list-topics", action="store_true",
@@ -396,17 +448,16 @@ def main():
                 print(f"  ! {proc}/{arm}: {e}"); continue
             if d is None:
                 continue
-            seg = segment_metrics(d, args.deadband, args.rom_pct, args.speed_pct, args.downsample)
+            seg = segment_metrics(d, args.deadband, args.rom_pct, args.speed_pct,
+                                  args.jaw_min_amp, args.downsample)
             sp = args.speed_pct
             for instr, m in seg.items():
                 rows.append({"procedure": proc, "arm": arm, "instrument": instr,
                              "tool_topic": tool_topic or "", **m})
                 print(f"  {proc:>6} {arm} {str(instr):<24} dur {m['duration_s']:6.1f}s | "
+                      f"actuations {m['jaw_actuations']:4d} (jaw {m['jaw_amp_deg']}\u00b0) | "
                       f"travel P/Y/R {m['pitch_travel_deg']:7.0f}/{m['yaw_travel_deg']:7.0f}/"
                       f"{m['roll_travel_deg']:7.0f} | "
-                      f"ROM P[{m['pitch_lo_deg']:.0f},{m['pitch_hi_deg']:.0f}] "
-                      f"Y[{m['yaw_lo_deg']:.0f},{m['yaw_hi_deg']:.0f}] "
-                      f"R[{m['roll_lo_deg']:.0f},{m['roll_hi_deg']:.0f}] | "
                       f"v{sp:g} P/Y/R {m['pitch_speed_p%g_degs' % sp]:5.0f}/"
                       f"{m['yaw_speed_p%g_degs' % sp]:5.0f}/{m['roll_speed_p%g_degs' % sp]:5.0f} deg/s")
             if tool_topic is None:
@@ -422,9 +473,10 @@ def main():
     pd.set_option("display.width", 200)
     sp = args.speed_pct
     spd_cols = ["pitch_speed_p%g_degs" % sp, "yaw_speed_p%g_degs" % sp, "roll_speed_p%g_degs" % sp]
-    print(f"Mean per instrument across procedures (travel deg | ROM span deg | "
+    print(f"Mean per instrument across procedures (actuations | travel deg | ROM span deg | "
           f"p{sp:g} speed deg/s):")
-    agg = df.groupby("instrument")[["pitch_travel_deg", "yaw_travel_deg", "roll_travel_deg",
+    agg = df.groupby("instrument")[["jaw_actuations",
+                                    "pitch_travel_deg", "yaw_travel_deg", "roll_travel_deg",
                                     "pitch_rom_deg", "yaw_rom_deg", "roll_rom_deg",
                                     *spd_cols, "duration_s"]].mean().round(1)
     print(agg.to_string())
