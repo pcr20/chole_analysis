@@ -512,20 +512,21 @@ def main():
     sm = args.summary_pct
     spd_cols = ["pitch_speed_p%g_degs" % sp, "yaw_speed_p%g_degs" % sp, "roll_speed_p%g_degs" % sp]
 
-    # 1) Means across procedures (linear -> safe to aggregate from per-procedure rows)
+    # ---- 1) Means across procedures (linear -> safe to aggregate from per-procedure rows)
     mean_cols = ["jaw_actuations",
                  "pitch_travel_deg", "yaw_travel_deg", "roll_travel_deg",
                  "pitch_rom_deg", "yaw_rom_deg", "roll_rom_deg",
                  *spd_cols, "duration_s"]
-    print(f"Mean per (instrument, arm) across procedures:")
-    print(df.groupby(["instrument", "arm"])[mean_cols].mean().round(1).to_string())
+    mean_tbl = df.groupby(["instrument", "arm"])[mean_cols].mean().round(1)
 
-    # 2) GLOBAL p_sm computed on the FULL pooled sample stream per (instrument, arm).
-    #    Per-sample data points -> single percentile -> avoids the nested-histogram error.
-    #    travel  -> p_sm of per-sample |Δθ|        (the step distribution that sums to travel)
-    #    rom     -> p_sm of pooled angle values   (upper bound of where the joint visits)
-    #    speed   -> p_sm of pooled |dθ/dt|         (the speed distribution)
-    #    actuations -> the one exception: p_sm of per-procedure counts (footnote below)
+    # ---- 2) p_sm across procedures, RESTRICTED to per-procedure scalars where
+    #         this calculation is legitimate (travel and duration). ROM/speed/step
+    #         require pooling, so they go in table 3; actuations also go there.
+    scalar_cols = ["pitch_travel_deg", "yaw_travel_deg", "roll_travel_deg", "duration_s"]
+    proc_p95_tbl = df.groupby(["instrument", "arm"])[scalar_cols].quantile(sm / 100.0).round(1)
+
+    # ---- 3) p_sm computed on the FULL pooled sample stream per (instrument, arm).
+    #         Per-sample data points -> single percentile -> avoids nested-histogram error.
     p95_rows = []
     act_p95 = df.groupby(["instrument", "arm"])["jaw_actuations"].quantile(sm / 100.0)
     for (instr, arm), gp in global_pool.items():
@@ -539,15 +540,38 @@ def main():
             row[f"{axis}_speed_degs"]  = round(float(np.percentile(spd,  sm)), 1) if spd.size  else np.nan
         row["actuations_per_proc"]    = round(float(act_p95.get((instr, arm), np.nan)), 1)
         p95_rows.append(row)
-    p95 = pd.DataFrame(p95_rows).set_index(["instrument", "arm"]).sort_index()
+    pool_p95_tbl = pd.DataFrame(p95_rows).set_index(["instrument", "arm"]).sort_index()
+
+    # ---- print to stdout
+    print("Mean per (instrument, arm) across procedures:")
+    print(mean_tbl.to_string())
+    print(f"\n{sm:g}th-percentile upper bound per (instrument, arm) across procedures "
+          f"(per-procedure scalars only):")
+    print(proc_p95_tbl.to_string())
     print(f"\n{sm:g}th-percentile upper bound, computed on the POOLED raw sample stream "
           f"per (instrument, arm):")
-    print(p95.to_string())
+    print(pool_p95_tbl.to_string())
     print(f"  (step_deg = per-sample |Δθ|, the distribution that sums to travel;"
           f" rom_hi_deg = upper bound of pooled angle values;"
           f" speed_degs = pooled |dθ/dt|.")
     print(f"   actuations is the one exception — it's a per-procedure event count "
           f"so its p{sm:g} is across the {df.groupby(['instrument','arm']).size().max()} per-procedure counts.)")
+
+    # ---- append the three tables to the CSV, with 2 blank rows before they start
+    with open(args.out, "a", newline="", encoding="utf-8") as f:
+        f.write("\n\n")                                       # 2 blank rows
+        f.write("# Mean per (instrument, arm) across procedures\n")
+        mean_tbl.to_csv(f)
+        f.write(f"\n# {sm:g}th-percentile upper bound across procedures "
+                f"(per-procedure scalars only: travel + duration)\n")
+        proc_p95_tbl.to_csv(f)
+        f.write(f"\n# {sm:g}th-percentile upper bound, POOLED raw sample stream "
+                f"per (instrument, arm)\n")
+        f.write("# step_deg=per-sample |dtheta|; rom_hi_deg=upper of pooled angle values; "
+                "speed_degs=pooled |dtheta/dt|; actuations_per_proc=p"
+                f"{sm:g} of per-procedure counts\n")
+        pool_p95_tbl.to_csv(f)
+    print(f"\n(summary tables appended to {args.out})")
 
 
 if __name__ == "__main__":

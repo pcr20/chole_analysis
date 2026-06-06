@@ -43,22 +43,18 @@ G_3,PSM1,all,,853.8,83092,0,0.0,False,5403.0,6614.1,8663.8,-78.5,47.8,126.2,-72.
 G_3,PSM2,all,,853.8,83092,21,87.0,True,1490.2,1938.8,1782.1,-1.5,66.7,68.3,-65.7,9.5,75.2,-141.9,-85.4,56.5,12.5,17.3,14.6
 
 
-Mean per (instrument, arm) across procedures:
-                 jaw_actuations  pitch_travel_deg  yaw_travel_deg  roll_travel_deg  pitch_rom_deg  yaw_rom_deg  roll_rom_deg  pitch_speed_p95_degs  yaw_speed_p95_degs  roll_speed_p95_degs  duration_s
-instrument arm
-all        PSM1             5.8            3704.2          4757.1           7264.9           77.3         95.0         198.2                  29.7                35.1                 51.8       766.4
-           PSM2            30.4            1714.8          2109.7           2580.2           67.7         79.6         105.0                  17.1                21.2                 24.7       766.4
+# Mean per (instrument, arm) across procedures
+instrument,arm,jaw_actuations,pitch_travel_deg,yaw_travel_deg,roll_travel_deg,pitch_rom_deg,yaw_rom_deg,roll_rom_deg,pitch_speed_p95_degs,yaw_speed_p95_degs,roll_speed_p95_degs,duration_s
+all,PSM1,5.8,3704.2,4757.1,7264.9,77.3,95.0,198.2,29.7,35.1,51.8,766.4
+all,PSM2,30.4,1714.8,2109.7,2580.2,67.7,79.6,105.0,17.1,21.2,24.7,766.4
 
-95th-percentile upper bound per (instrument, arm) across procedures:
-                 jaw_actuations  pitch_travel_deg  yaw_travel_deg  roll_travel_deg  pitch_rom_deg  yaw_rom_deg  roll_rom_deg  pitch_speed_p95_degs  yaw_speed_p95_degs  roll_speed_p95_degs  duration_s
-instrument arm
-all        PSM1            16.0            7905.2          9558.6          15696.8          126.2        156.1         320.2                  47.5                57.2                 81.2      1127.1
-           PSM2            55.0            3968.5          3989.2           4455.7          103.8        107.0         183.1                  26.6                29.4                 38.4      1127.1
+# 95th-percentile upper bound across procedures (per-procedure scalars only: travel + duration)
+instrument,arm,pitch_travel_deg,yaw_travel_deg,roll_travel_deg,duration_s
+all,PSM1,7905.2,9558.6,15696.8,1127.1
+all,PSM2,3968.5,3989.2,4455.7,1127.1
 
-95th-percentile upper bound, computed on the POOLED raw sample stream per (instrument, arm):
-                 pitch_step_deg  pitch_rom_hi_deg  pitch_speed_degs  yaw_step_deg  yaw_rom_hi_deg  yaw_speed_degs  roll_step_deg  roll_rom_hi_deg  roll_speed_degs  actuations_per_proc
-instrument arm
-all        PSM1            0.29              58.6              28.2          0.34            61.0            33.2           0.48            254.0             47.7                 16.0
-           PSM2            0.17              48.4              17.1          0.20            60.1            19.8           0.23             17.3             23.1                 55.0
-  (step_deg = per-sample |Δθ|, the distribution that sums to travel; rom_hi_deg = upper bound of pooled angle values; speed_degs = pooled |dθ/dt|.
-   actuations is the one exception — it's a per-procedure event count so its p95 is across the 21 per-procedure counts.)
+# 95th-percentile upper bound, POOLED raw sample stream per (instrument, arm)
+# step_deg=per-sample |dtheta|; rom_hi_deg=upper of pooled angle values; speed_degs=pooled |dtheta/dt|; actuations_per_proc=p95 of per-procedure counts
+instrument,arm,pitch_step_deg,pitch_rom_hi_deg,pitch_speed_degs,yaw_step_deg,yaw_rom_hi_deg,yaw_speed_degs,roll_step_deg,roll_rom_hi_deg,roll_speed_degs,actuations_per_proc
+all,PSM1,0.29,58.6,28.2,0.34,61.0,33.2,0.48,254.0,47.7,16.0
+all,PSM2,0.17,48.4,17.1,0.2,60.1,19.8,0.23,17.3,23.1,55.0
