@@ -68,6 +68,19 @@ def rom_bounds_deg(theta_rad, pct=95.0):
     return (float(lo), float(hi), float(hi - lo))
 
 
+def abs_speed_deg_s(theta_rad, t):
+    """Per-sample |angular velocity| in deg/s within ONE contiguous run.
+    Uses the actual timestamps (handles sampling jitter). Direction-agnostic."""
+    if len(theta_rad) < 2:
+        return np.array([])
+    th = np.degrees(np.unwrap(np.asarray(theta_rad, dtype=float)))
+    dt = np.diff(np.asarray(t, dtype=float))
+    dth = np.abs(np.diff(th))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        spd = dth / dt
+    return spd[np.isfinite(spd) & (dt > 0)]
+
+
 def resolve_joint_indices(names):
     """Map roll/pitch/yaw to joint indices using names; fall back to defaults."""
     idx = dict(DEFAULT_IDX)
@@ -159,7 +172,7 @@ def label_instruments(t, tool_t, tool_name):
     return labels.astype(object)
 
 
-def segment_metrics(d, deadband, rom_pct, downsample):
+def segment_metrics(d, deadband, rom_pct, speed_pct, downsample):
     """Return {instrument: metrics dict} for a single arm's data dict."""
     t = d["t"]
     if downsample > 1:
@@ -183,7 +196,8 @@ def segment_metrics(d, deadband, rom_pct, downsample):
         acc = results.setdefault(name, {
             "pitch_travel": 0.0, "yaw_travel": 0.0, "roll_travel": 0.0,
             "dur": 0.0, "n": 0,
-            "pitch_vals": [], "yaw_vals": [], "roll_vals": []})
+            "pitch_vals": [], "yaw_vals": [], "roll_vals": [],
+            "pitch_spd": [], "yaw_spd": [], "roll_spd": []})
         acc["pitch_travel"] += total_variation_deg(pitch[s:e], deadband)
         acc["yaw_travel"] += total_variation_deg(yaw[s:e], deadband)
         acc["roll_travel"] += total_variation_deg(roll[s:e], deadband)
@@ -193,6 +207,13 @@ def segment_metrics(d, deadband, rom_pct, downsample):
         acc["pitch_vals"].append(pitch[s:e])
         acc["yaw_vals"].append(yaw[s:e])
         acc["roll_vals"].append(roll[s:e])
+        acc["pitch_spd"].append(abs_speed_deg_s(pitch[s:e], t[s:e]))
+        acc["yaw_spd"].append(abs_speed_deg_s(yaw[s:e], t[s:e]))
+        acc["roll_spd"].append(abs_speed_deg_s(roll[s:e], t[s:e]))
+
+    def pctl(chunks, q):
+        arr = np.concatenate(chunks) if chunks else np.array([])
+        return float(np.percentile(arr, q)) if arr.size else np.nan
 
     out = {}
     for name, a in results.items():
@@ -208,6 +229,9 @@ def segment_metrics(d, deadband, rom_pct, downsample):
             "pitch_lo_deg": round(pl, 1), "pitch_hi_deg": round(pu, 1), "pitch_rom_deg": round(ps, 1),
             "yaw_lo_deg": round(yl, 1), "yaw_hi_deg": round(yu, 1), "yaw_rom_deg": round(ys, 1),
             "roll_lo_deg": round(rl, 1), "roll_hi_deg": round(ru, 1), "roll_rom_deg": round(rs, 1),
+            "pitch_speed_p%g_degs" % speed_pct: round(pctl(a["pitch_spd"], speed_pct), 1),
+            "yaw_speed_p%g_degs" % speed_pct: round(pctl(a["yaw_spd"], speed_pct), 1),
+            "roll_speed_p%g_degs" % speed_pct: round(pctl(a["roll_spd"], speed_pct), 1),
         }
     return out
 
@@ -329,6 +353,8 @@ def main():
     ap.add_argument("--tool-topic", help="override the instrument-type topic name")
     ap.add_argument("--deadband", type=float, default=0.10, help="noise gate, deg/sample")
     ap.add_argument("--rom-pct", type=float, default=95.0, help="central pct for ROM bounds")
+    ap.add_argument("--speed-pct", type=float, default=95.0,
+                    help="one-sided upper pct for |angular speed| (default 95)")
     ap.add_argument("--downsample", type=int, default=1)
     ap.add_argument("--out", default="crcd_angular_path_by_instrument.csv")
     ap.add_argument("--list-topics", action="store_true",
@@ -370,7 +396,8 @@ def main():
                 print(f"  ! {proc}/{arm}: {e}"); continue
             if d is None:
                 continue
-            seg = segment_metrics(d, args.deadband, args.rom_pct, args.downsample)
+            seg = segment_metrics(d, args.deadband, args.rom_pct, args.speed_pct, args.downsample)
+            sp = args.speed_pct
             for instr, m in seg.items():
                 rows.append({"procedure": proc, "arm": arm, "instrument": instr,
                              "tool_topic": tool_topic or "", **m})
@@ -379,7 +406,9 @@ def main():
                       f"{m['roll_travel_deg']:7.0f} | "
                       f"ROM P[{m['pitch_lo_deg']:.0f},{m['pitch_hi_deg']:.0f}] "
                       f"Y[{m['yaw_lo_deg']:.0f},{m['yaw_hi_deg']:.0f}] "
-                      f"R[{m['roll_lo_deg']:.0f},{m['roll_hi_deg']:.0f}]")
+                      f"R[{m['roll_lo_deg']:.0f},{m['roll_hi_deg']:.0f}] | "
+                      f"v{sp:g} P/Y/R {m['pitch_speed_p%g_degs' % sp]:5.0f}/"
+                      f"{m['yaw_speed_p%g_degs' % sp]:5.0f}/{m['roll_speed_p%g_degs' % sp]:5.0f} deg/s")
             if tool_topic is None:
                 print(f"        (no tool topic for {arm}; reported as 'all'. "
                       f"Run --list-topics to check.)")
@@ -390,11 +419,14 @@ def main():
     df.to_csv(args.out, index=False)
     print(f"\nWrote {args.out}  ({len(df)} rows)\n")
 
-    pd.set_option("display.width", 160)
-    print("Mean per instrument across procedures (travel deg, ROM span deg):")
+    pd.set_option("display.width", 200)
+    sp = args.speed_pct
+    spd_cols = ["pitch_speed_p%g_degs" % sp, "yaw_speed_p%g_degs" % sp, "roll_speed_p%g_degs" % sp]
+    print(f"Mean per instrument across procedures (travel deg | ROM span deg | "
+          f"p{sp:g} speed deg/s):")
     agg = df.groupby("instrument")[["pitch_travel_deg", "yaw_travel_deg", "roll_travel_deg",
                                     "pitch_rom_deg", "yaw_rom_deg", "roll_rom_deg",
-                                    "duration_s"]].mean().round(0)
+                                    *spd_cols, "duration_s"]].mean().round(1)
     print(agg.to_string())
 
 
