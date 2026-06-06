@@ -81,6 +81,14 @@ def abs_speed_deg_s(theta_rad, t):
     return spd[np.isfinite(spd) & (dt > 0)]
 
 
+def abs_step_deg(theta_rad):
+    """Per-sample |Δθ| in degrees (the per-step increments that sum to travel)."""
+    if len(theta_rad) < 2:
+        return np.array([], dtype=np.float32)
+    th = np.unwrap(np.asarray(theta_rad, dtype=float))
+    return np.abs(np.degrees(np.diff(th))).astype(np.float32)
+
+
 def count_actuations(jaw_rad, min_amp_deg=10.0):
     """Count grasp/cut actuations = jaw open->close transitions, with hysteresis.
     Returns (n_actuations, jaw_amplitude_deg). A non-jawed tool (e.g. cautery hook)
@@ -226,8 +234,9 @@ def segment_metrics(d, deadband, rom_pct, speed_pct, jaw_min_amp, downsample):
             a["amp"].append(jaw[s:e])
 
     results = {}
+    pool = {}
     if len(t) == 0:
-        return results
+        return results, pool
 
     # contiguous runs (so travel is not counted across a swap-out/in gap)
     change = np.where(labels[1:] != labels[:-1])[0] + 1
@@ -240,7 +249,8 @@ def segment_metrics(d, deadband, rom_pct, speed_pct, jaw_min_amp, downsample):
             "pitch_travel": 0.0, "yaw_travel": 0.0, "roll_travel": 0.0,
             "dur": 0.0, "n": 0,
             "pitch_vals": [], "yaw_vals": [], "roll_vals": [],
-            "pitch_spd": [], "yaw_spd": [], "roll_spd": []})
+            "pitch_spd": [], "yaw_spd": [], "roll_spd": [],
+            "pitch_step": [], "yaw_step": [], "roll_step": []})
         acc["pitch_travel"] += total_variation_deg(pitch[s:e], deadband)
         acc["yaw_travel"] += total_variation_deg(yaw[s:e], deadband)
         acc["roll_travel"] += total_variation_deg(roll[s:e], deadband)
@@ -253,6 +263,9 @@ def segment_metrics(d, deadband, rom_pct, speed_pct, jaw_min_amp, downsample):
         acc["pitch_spd"].append(abs_speed_deg_s(pitch[s:e], t[s:e]))
         acc["yaw_spd"].append(abs_speed_deg_s(yaw[s:e], t[s:e]))
         acc["roll_spd"].append(abs_speed_deg_s(roll[s:e], t[s:e]))
+        acc["pitch_step"].append(abs_step_deg(pitch[s:e]))
+        acc["yaw_step"].append(abs_step_deg(yaw[s:e]))
+        acc["roll_step"].append(abs_step_deg(roll[s:e]))
 
     def pctl(chunks, q):
         arr = np.concatenate(chunks) if chunks else np.array([])
@@ -283,7 +296,21 @@ def segment_metrics(d, deadband, rom_pct, speed_pct, jaw_min_amp, downsample):
             "yaw_speed_p%g_degs" % speed_pct: round(pctl(a["yaw_spd"], speed_pct), 1),
             "roll_speed_p%g_degs" % speed_pct: round(pctl(a["roll_spd"], speed_pct), 1),
         }
-    return out
+        # per-segment raw-sample pool for true global percentiles later (float32 to save RAM)
+        def _cat32(chunks):
+            return (np.concatenate(chunks).astype(np.float32) if chunks else np.array([], dtype=np.float32))
+        pool[name] = {
+            "pitch_angle_deg": np.degrees(np.unwrap(pv)).astype(np.float32),
+            "yaw_angle_deg":   np.degrees(np.unwrap(yv)).astype(np.float32),
+            "roll_angle_deg":  np.degrees(np.unwrap(rv)).astype(np.float32),
+            "pitch_step_deg":  _cat32(a["pitch_step"]),
+            "yaw_step_deg":    _cat32(a["yaw_step"]),
+            "roll_step_deg":   _cat32(a["roll_step"]),
+            "pitch_speed_degs": _cat32(a["pitch_spd"]),
+            "yaw_speed_degs":   _cat32(a["yaw_spd"]),
+            "roll_speed_degs":  _cat32(a["roll_spd"]),
+        }
+    return out, pool
 
 
 def proc_name_from_path(p, root):
@@ -407,6 +434,8 @@ def main():
                     help="one-sided upper pct for |angular speed| (default 95)")
     ap.add_argument("--jaw-min-amp", type=float, default=10.0,
                     help="min jaw swing (deg) to count as an actuating tool (else 0)")
+    ap.add_argument("--summary-pct", type=float, default=95.0,
+                    help="upper percentile for the across-procedures summary (default 95)")
     ap.add_argument("--downsample", type=int, default=1)
     ap.add_argument("--out", default="crcd_angular_path_by_instrument.csv")
     ap.add_argument("--list-topics", action="store_true",
@@ -437,6 +466,10 @@ def main():
           f"rom={args.rom_pct}% downsample={args.downsample}x\n")
 
     rows = []
+    global_pool = {}        # (arm, instrument) -> {key: [chunks of float32]}
+    pool_keys = ["pitch_angle_deg", "yaw_angle_deg", "roll_angle_deg",
+                 "pitch_step_deg", "yaw_step_deg", "roll_step_deg",
+                 "pitch_speed_degs", "yaw_speed_degs", "roll_speed_degs"]
     for bag in bags:
         proc = proc_name_from_path(bag, root_dir)
         topics = list_topics(bag)
@@ -448,12 +481,16 @@ def main():
                 print(f"  ! {proc}/{arm}: {e}"); continue
             if d is None:
                 continue
-            seg = segment_metrics(d, args.deadband, args.rom_pct, args.speed_pct,
-                                  args.jaw_min_amp, args.downsample)
+            seg, seg_pool = segment_metrics(d, args.deadband, args.rom_pct, args.speed_pct,
+                                            args.jaw_min_amp, args.downsample)
             sp = args.speed_pct
             for instr, m in seg.items():
                 rows.append({"procedure": proc, "arm": arm, "instrument": instr,
                              "tool_topic": tool_topic or "", **m})
+                key = (instr, arm)
+                gp = global_pool.setdefault(key, {k: [] for k in pool_keys})
+                for k in pool_keys:
+                    gp[k].append(seg_pool[instr][k])
                 print(f"  {proc:>6} {arm} {str(instr):<24} dur {m['duration_s']:6.1f}s | "
                       f"actuations {m['jaw_actuations']:4d} (jaw {m['jaw_amp_deg']}\u00b0) | "
                       f"travel P/Y/R {m['pitch_travel_deg']:7.0f}/{m['yaw_travel_deg']:7.0f}/"
@@ -470,16 +507,47 @@ def main():
     df.to_csv(args.out, index=False)
     print(f"\nWrote {args.out}  ({len(df)} rows)\n")
 
-    pd.set_option("display.width", 200)
+    pd.set_option("display.width", 220)
     sp = args.speed_pct
+    sm = args.summary_pct
     spd_cols = ["pitch_speed_p%g_degs" % sp, "yaw_speed_p%g_degs" % sp, "roll_speed_p%g_degs" % sp]
-    print(f"Mean per instrument across procedures (actuations | travel deg | ROM span deg | "
-          f"p{sp:g} speed deg/s):")
-    agg = df.groupby("instrument")[["jaw_actuations",
-                                    "pitch_travel_deg", "yaw_travel_deg", "roll_travel_deg",
-                                    "pitch_rom_deg", "yaw_rom_deg", "roll_rom_deg",
-                                    *spd_cols, "duration_s"]].mean().round(1)
-    print(agg.to_string())
+
+    # 1) Means across procedures (linear -> safe to aggregate from per-procedure rows)
+    mean_cols = ["jaw_actuations",
+                 "pitch_travel_deg", "yaw_travel_deg", "roll_travel_deg",
+                 "pitch_rom_deg", "yaw_rom_deg", "roll_rom_deg",
+                 *spd_cols, "duration_s"]
+    print(f"Mean per (instrument, arm) across procedures:")
+    print(df.groupby(["instrument", "arm"])[mean_cols].mean().round(1).to_string())
+
+    # 2) GLOBAL p_sm computed on the FULL pooled sample stream per (instrument, arm).
+    #    Per-sample data points -> single percentile -> avoids the nested-histogram error.
+    #    travel  -> p_sm of per-sample |Δθ|        (the step distribution that sums to travel)
+    #    rom     -> p_sm of pooled angle values   (upper bound of where the joint visits)
+    #    speed   -> p_sm of pooled |dθ/dt|         (the speed distribution)
+    #    actuations -> the one exception: p_sm of per-procedure counts (footnote below)
+    p95_rows = []
+    act_p95 = df.groupby(["instrument", "arm"])["jaw_actuations"].quantile(sm / 100.0)
+    for (instr, arm), gp in global_pool.items():
+        row = {"instrument": instr, "arm": arm}
+        for axis in ("pitch", "yaw", "roll"):
+            step = np.concatenate(gp[f"{axis}_step_deg"]) if gp[f"{axis}_step_deg"] else np.array([])
+            ang  = np.concatenate(gp[f"{axis}_angle_deg"]) if gp[f"{axis}_angle_deg"] else np.array([])
+            spd  = np.concatenate(gp[f"{axis}_speed_degs"]) if gp[f"{axis}_speed_degs"] else np.array([])
+            row[f"{axis}_step_deg"]    = round(float(np.percentile(step, sm)), 2) if step.size else np.nan
+            row[f"{axis}_rom_hi_deg"]  = round(float(np.percentile(ang,  sm)), 1) if ang.size  else np.nan
+            row[f"{axis}_speed_degs"]  = round(float(np.percentile(spd,  sm)), 1) if spd.size  else np.nan
+        row["actuations_per_proc"]    = round(float(act_p95.get((instr, arm), np.nan)), 1)
+        p95_rows.append(row)
+    p95 = pd.DataFrame(p95_rows).set_index(["instrument", "arm"]).sort_index()
+    print(f"\n{sm:g}th-percentile upper bound, computed on the POOLED raw sample stream "
+          f"per (instrument, arm):")
+    print(p95.to_string())
+    print(f"  (step_deg = per-sample |Δθ|, the distribution that sums to travel;"
+          f" rom_hi_deg = upper bound of pooled angle values;"
+          f" speed_degs = pooled |dθ/dt|.")
+    print(f"   actuations is the one exception — it's a per-procedure event count "
+          f"so its p{sm:g} is across the {df.groupby(['instrument','arm']).size().max()} per-procedure counts.)")
 
 
 if __name__ == "__main__":
